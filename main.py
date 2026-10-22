@@ -310,7 +310,7 @@ def crm_search_menu(message):
 @bot.message_handler(func=lambda msg: msg.from_user.id in user_states and user_states[msg.from_user.id].get("step") == "waiting_search")
 def perform_search(message):
     query = f"%{message.text.strip()}%"
-    conn = sqlite3.connect("crm_bot.db", check_same_thread=False)
+    conn = sqlite3.connect("/var/crm_bot.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("""
         SELECT id, order_number, full_name, phone, city, branch, price, note, status, ttn, author FROM orders 
