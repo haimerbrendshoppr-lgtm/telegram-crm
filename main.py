@@ -73,7 +73,7 @@ def get_order_inline_markup(order_id):
 
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
-    conn = sqlite3.connect("crm_bot.db", check_same_thread=False)
+    conn = sqlite3.connect("/var/crm_bot.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("SELECT role FROM users WHERE user_id = ?", (message.from_user.id,))
     user = cursor.fetchone()
@@ -100,7 +100,7 @@ def process_password(message):
         "dropgjrci385": "shipper"
     }
 
-    conn = sqlite3.connect("crm_bot.db", check_same_thread=False)
+    conn = sqlite3.connect("/var/crm_bot.db", check_same_thread=False)
     cursor = conn.cursor()
 
     if password in passwords_map:
@@ -145,7 +145,7 @@ def cancel_all_actions(message):
     if user_id in user_states:
         del user_states[user_id]
         
-    conn = sqlite3.connect("crm_bot.db", check_same_thread=False)
+    conn = sqlite3.connect("/var/crm_bot.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
     user = cursor.fetchone()
@@ -195,7 +195,7 @@ def handle_order_flow(message):
         data = state["data"]
         note = message.text
         
-        conn = sqlite3.connect("crm_bot.db", check_same_thread=False)
+        conn = sqlite3.connect("/var/crm_bot.db", check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute("SELECT role, name FROM users WHERE user_id = ?", (user_id,))
         user = cursor.fetchone()
@@ -220,7 +220,7 @@ def message_in_order_flow(message):
 
 @bot.message_handler(func=lambda msg: msg.text == "📦 Переглянути замовлення (не надіслані)")
 def view_unsent_orders(message):
-    conn = sqlite3.connect("crm_bot.db", check_same_thread=False)
+    conn = sqlite3.connect("/var/crm_bot.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("SELECT id, order_number, full_name, phone, price, status, city, branch, note, ttn FROM orders WHERE status != 'Надіслано' ORDER BY id DESC LIMIT 50")
     orders = cursor.fetchall()
@@ -243,7 +243,7 @@ def view_unsent_orders(message):
 
 @bot.message_handler(func=lambda msg: msg.text == "📋 Переглянути всі замовлення (50)")
 def view_last_50(message):
-    conn = sqlite3.connect("crm_bot.db", check_same_thread=False)
+    conn = sqlite3.connect("/var/crm_bot.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("SELECT id, order_number, full_name, phone, price, status, city, branch, note, ttn FROM orders ORDER BY id DESC LIMIT 50")
     orders = cursor.fetchall()
@@ -266,7 +266,7 @@ def view_last_50(message):
 
 @bot.message_handler(func=lambda msg: msg.text == "📊 Статистика")
 def show_statistics(message):
-    conn = sqlite3.connect("crm_bot.db", check_same_thread=False)
+    conn = sqlite3.connect("/var/crm_bot.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM orders")
     total_orders = cursor.fetchone()[0]
@@ -284,7 +284,7 @@ def show_statistics(message):
 
 @bot.message_handler(func=lambda msg: msg.text == "👥 Хто заходив у систему")
 def show_logged_users(message):
-    conn = sqlite3.connect("crm_bot.db", check_same_thread=False)
+    conn = sqlite3.connect("/var/crm_bot.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, role, name FROM users WHERE role != 'blocked_temp'")
     users = cursor.fetchall()
@@ -351,7 +351,7 @@ def callback_handler(call):
         order_id = parts[1]
         new_status = parts[2]
         
-        conn = sqlite3.connect("crm_bot.db", check_same_thread=False)
+        conn = sqlite3.connect("/var/crm_bot.db", check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute("UPDATE orders SET status = ? WHERE id = ?", (new_status, order_id))
         conn.commit()
@@ -384,7 +384,7 @@ def save_ttn_input(message):
     ttn = message.text.strip()
     order_id = user_states[user_id]["order_id"]
     
-    conn = sqlite3.connect("crm_bot.db", check_same_thread=False)
+    conn = sqlite3.connect("/var/crm_bot.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("UPDATE orders SET ttn = ? WHERE id = ?", (ttn, order_id))
     conn.commit()
