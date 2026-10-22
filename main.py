@@ -8,7 +8,7 @@ TOKEN = "8709866998:AAFOTBJ_QphNhTCSjbo3BySKAeaznxSa9CE"
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
 def init_db():
-    conn = sqlite3.connect("crm_bot.db", check_same_thread=False)
+    conn = sqlite3.connect("/var/crm_bot.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
