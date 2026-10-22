@@ -130,7 +130,7 @@ def process_password(message):
 
 @bot.message_handler(func=lambda msg: msg.text == "🚪 Вийти з акаунта")
 def logout(message):
-    conn = sqlite3.connect("crm_bot.db", check_same_thread=False)
+    conn = sqlite3.connect("/var/crm_bot.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM users WHERE user_id = ?", (message.from_user.id,))
     conn.commit()
