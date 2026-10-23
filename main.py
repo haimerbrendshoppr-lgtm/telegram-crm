@@ -4812,6 +4812,27 @@ def run_bot():
     finally:
         stop_event.set()
 
+def validate_configuration():
+    configured = [
+        password
+        for password in PASSWORD_ENV.values()
+        if password
+    ]
+
+    if not configured:
+        raise RuntimeError(
+            "Set at least one CRM role password in environment variables."
+        )
+
+    if len(configured) != len(set(configured)):
+        raise RuntimeError(
+            "Role passwords must be unique."
+        )
+
+    if not PASSWORD_ENV.get("owner"):
+        logger.warning(
+            "CRM_PASSWORD_OWNER is not configured."
+        )
 
 if __name__ == "__main__":
     run_bot()
