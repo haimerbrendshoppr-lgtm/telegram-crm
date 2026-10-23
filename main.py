@@ -1,3 +1,6 @@
+
+
+
 import os
 import time
 import json
@@ -50,6 +53,7 @@ PASSWORD_ENV = {
 PASSWORDS_MAP = {password: role for role, password in PASSWORD_ENV.items() if password}
 PERMISSIONS = {
     "create_order": "Створювати замовлення",
+    "manage_order_status": "Змінювати будь-які статуси замовлень",
     "view_unsent_orders": "Переглядати ненадіслані замовлення",
     "view_all_orders": "Переглядати всі замовлення",
     "search_orders": "Шукати замовлення",
@@ -68,7 +72,7 @@ PERMISSIONS = {
 }
 ROLE_DEFAULT_PERMISSIONS = {
     "owner": set(PERMISSIONS),
-    "manager": {"create_order", "view_unsent_orders", "view_all_orders",
+    "manager": {"create_order", "manage_order_status", "view_unsent_orders", "view_all_orders",
                 "search_orders", "delete_own_order", "delete_any_order",
                 "view_shifts", "use_ai", "use_psychologist", "view_tickets",
                 "manage_sos"},
@@ -81,8 +85,14 @@ ROLE_DEFAULT_PERMISSIONS = {
     "shipper": {"create_order", "view_all_orders", "search_orders",
                 "delete_own_order", "view_shifts", "use_ai"},
 }
-ORDER_STATUSES = {"Нове": "new", "В роботі": "working",
-                  "Надіслано": "sent", "Скасовано": "cancelled"}
+ORDER_STATUSES = {
+    "Не зібрано": "not_collected",
+    "Зібрано": "collected",
+    "Нове": "new",
+    "В роботі": "working",
+    "Надіслано": "sent",
+    "Скасовано": "cancelled",
+}
 SOS_REASONS = ["Загроза / небезпека", "Конфлікт", "Крадіжка",
                "Медична ситуація", "Технічна аварія", "Інше"]
 TICKET_CATEGORIES = ["Зарплата", "Графік", "Робоче питання",
@@ -146,6 +156,7 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             username TEXT DEFAULT '',
             full_name TEXT DEFAULT '',
+            display_name TEXT DEFAULT '',
             role TEXT DEFAULT '',
             is_blocked INTEGER DEFAULT 0,
             created_at TEXT DEFAULT ''
@@ -172,6 +183,7 @@ def init_db():
             event TEXT NOT NULL,
             details TEXT DEFAULT '{}',
             created_at TEXT NOT NULL
+
         );
         CREATE TABLE IF NOT EXISTS user_permissions (
             user_id INTEGER NOT NULL,
@@ -251,6 +263,29 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             psychologist_consent INTEGER DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS ai_conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'assistant',
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_conversations_user ON ai_conversations(user_id, mode, id);
+        CREATE TABLE IF NOT EXISTS daily_report_log (
+            report_date TEXT PRIMARY KEY,
+            sent_at TEXT NOT NULL,
+            pending_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS daily_report_delivery (
+            report_date TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_attempt TEXT DEFAULT '',
+            last_error TEXT DEFAULT '',
+            PRIMARY KEY (report_date, user_id)
+        );
         CREATE TABLE IF NOT EXISTS ai_issue_categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -263,6 +298,7 @@ def init_db():
             "users": {
                 "username": "TEXT DEFAULT ''",
                 "full_name": "TEXT DEFAULT ''",
+                "display_name": "TEXT DEFAULT ''",
                 "role": "TEXT DEFAULT ''",
                 "is_blocked": "INTEGER DEFAULT 0",
                 "created_at": "TEXT DEFAULT ''",
@@ -336,6 +372,9 @@ def get_role(user_id):
     return user["role"] if user and user["role"] else ""
 
 def has_permission(user_id, permission):
+    # Block status always wins, including for owner callbacks.
+    if is_blocked(user_id):
+        return False
     role = get_role(user_id)
     if role == "owner":
         return True
@@ -441,7 +480,8 @@ def main_keyboard(user_id):
     if has_permission(user_id, "manage_users"):
         options.append("👥 Користувачі")
     if has_permission(user_id, "manage_shifts"):
-        options.append("🗓 Керування змінами")
+        options.append("🗓 Призначити зміни")
+        options.append("📅 Графік команди")
     if has_permission(user_id, "broadcast"):
         options.append("📣 Розсилка")
     if has_permission(user_id, "use_ai"):
@@ -465,14 +505,26 @@ def cancel_or_home(text="Скасовано."):
     return text in {"❌ Скасувати", "🏠 Головне меню", "/cancel"}
 
 def get_staff_users():
+    # Only active operational users are eligible for shift assignment.
     with db_connection() as conn:
         return conn.execute("""
-            SELECT user_id,username,full_name,role FROM users
-            WHERE role!='' ORDER BY full_name, user_id
+            SELECT user_id,username,full_name,display_name,role FROM users
+            WHERE role IN ('manager','staff','collector','shipper') AND is_blocked=0
+            ORDER BY role, COALESCE(NULLIF(display_name,''),full_name,username), user_id
         """).fetchall()
 
+def user_label(user):
+    if not user:
+        return "Невідомий користувач"
+    return (user["display_name"] or user["full_name"] or
+            (f"@{user['username']}" if user["username"] else str(user["user_id"])))
+
+def user_label_by_id(user_id):
+    return user_label(get_user(user_id))
+
+
 def format_user(user):
-    name = user["full_name"] or user["username"] or str(user["user_id"])
+    name = user_label(user)
     role = ROLE_LABELS.get(user["role"], user["role"] or "Не авторизований")
     return f"{esc(name)} · {esc(role)} · ID <code>{user['user_id']}</code>"
 
@@ -496,6 +548,7 @@ def can_delete_order(user_id, order):
 
 def order_summary(order):
     return (
+
         f"📦 <b>Замовлення #{order['id']}</b>\n"
         f"Номер: {esc(order['order_number'])}\n"
         f"Клієнт: {esc(order['full_name'])}\n"
@@ -565,36 +618,56 @@ def create_order_record(user_id, data):
 
 
 def update_order_status(order_id, status, user_id):
+    """Validate authorization and business rules at the data mutation boundary."""
     if status not in ORDER_STATUSES:
         raise ValueError("Невідомий статус замовлення.")
+    if not is_logged_in(user_id):
+        raise PermissionError("Потрібна авторизація.")
+
+    role = get_role(user_id)
+    if role == "owner":
+        allowed = True
+    elif status == "Зібрано":
+        allowed = role == "collector" or has_permission(user_id, "manage_order_status")
+    elif status == "Надіслано":
+        allowed = role == "shipper" or has_permission(user_id, "manage_order_status")
+    elif status in ("Нове", "В роботі", "Не зібрано", "Скасовано"):
+        allowed = has_permission(user_id, "manage_order_status")
+    else:
+        allowed = False
+    if not allowed:
+        raise PermissionError("У вас немає права встановлювати цей статус.")
 
     with db_connection() as conn:
-        order = conn.execute(
-            "SELECT * FROM orders WHERE id=?", (order_id,)
-        ).fetchone()
+        order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
         if not order:
             return False
-
+        if status == "Надіслано" and not str(order["ttn"] or "").strip():
+            raise ValueError("Не можна позначити замовлення надісланим без ТТН.")
+        if status == "Зібрано" and order["status"] == "Скасовано":
+            raise ValueError("Скасоване замовлення не можна позначити зібраним.")
         sent_at = now_text() if status == "Надіслано" else order["sent_at"]
-        conn.execute(
-            "UPDATE orders SET status=?, sent_at=? WHERE id=?",
-            (status, sent_at, order_id),
-        )
+        conn.execute("UPDATE orders SET status=?, sent_at=? WHERE id=?", (status, sent_at, order_id))
 
     audit_order_action(user_id, "status_changed", order_id, {"status": status})
     return True
 
 
 def update_order_ttn(order_id, ttn, user_id):
+    ttn = str(ttn or "").strip()
+    if not ttn:
+        raise ValueError("ТТН не може бути порожньою.")
     with db_connection() as conn:
         order = conn.execute(
-            "SELECT id FROM orders WHERE id=?", (order_id,)
+            "SELECT id,status FROM orders WHERE id=?", (order_id,)
         ).fetchone()
         if not order:
             return False
+        if order["status"] not in ("Зібрано", "В роботі", "Надіслано"):
+            raise PermissionError("Спочатку збирач має позначити замовлення «Зібрано».")
         conn.execute(
             "UPDATE orders SET ttn=? WHERE id=?",
-            (str(ttn).strip(), order_id),
+            (ttn, order_id),
         )
 
     audit_order_action(user_id, "ttn_updated", order_id)
@@ -658,6 +731,7 @@ def show_orders(chat_id, user_id, unsent=False, query=None):
         if can_delete_order(user_id, order):
             keyboard.add(types.InlineKeyboardButton(
                 "🗑 Видалити", callback_data=f"order_delete:{order['id']}"
+
             ))
         bot.send_message(
             chat_id, order_summary(order), reply_markup=keyboard
@@ -840,6 +914,7 @@ def handle_login(message):
     clear_state(uid)
     log_event("login_success", uid, {"role": role})
     bot.send_message(
+
         message.chat.id,
         f"✅ Авторизація успішна. Роль: <b>{esc(ROLE_LABELS[role])}</b>",
         reply_markup=main_keyboard(uid),
@@ -961,9 +1036,13 @@ def callback_set_status(call):
             return
         bot.answer_callback_query(call.id, "Статус оновлено.")
         bot.send_message(call.message.chat.id, f"✅ Статус замовлення #{order_id}: {esc(status)}")
+    except PermissionError as exc:
+        bot.answer_callback_query(call.id, str(exc)[:180], show_alert=True)
+    except ValueError as exc:
+        bot.answer_callback_query(call.id, str(exc)[:180], show_alert=True)
     except Exception:
         logger.exception("Status update failed")
-        bot.answer_callback_query(call.id, "Не вдалося змінити статус.")
+        bot.answer_callback_query(call.id, "Не вдалося змінити статус.", show_alert=True)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("order_ttn:"))
@@ -975,6 +1054,9 @@ def callback_order_ttn(call):
 
     try:
         order_id = int(call.data.split(":", 1)[1])
+        if get_role(uid) not in ("owner", "manager", "shipper") and not has_permission(uid, "manage_users"):
+            bot.answer_callback_query(call.id, "Немає права додавати ТТН.", show_alert=True)
+            return
         if not get_order(order_id):
             bot.answer_callback_query(call.id, "Замовлення не знайдено.")
             return
@@ -1015,188 +1097,7 @@ def handle_order_ttn_input(message):
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("order_delete:"))
-def callback_order_delete(call):
-    uid = call.from_user.id
-    if not is_logged_in(uid):
-        bot.answer_callback_query(call.id, "Спочатку авторизуйся.")
-        return
 
-    try:
-        order_id = int(call.data.split(":", 1)[1])
-        order = get_order(order_id)
-        if not order:
-            bot.answer_callback_query(call.id, "Замовлення не знайдено.")
-            return
-        if not can_delete_order(uid, order):
-            bot.answer_callback_query(call.id, "Немає прав на видалення.")
-            return
-
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.row(
-            types.InlineKeyboardButton(
-                "Так, видалити", callback_data=f"confirm_delete:{order_id}"
-            ),
-            types.InlineKeyboardButton(
-                "Скасувати", callback_data="cancel_delete"
-            ),
-        )
-        bot.send_message(
-            call.message.chat.id,
-            f"⚠️ Точно видалити замовлення #{order_id}?",
-            reply_markup=keyboard,
-        )
-        bot.answer_callback_query(call.id)
-    except Exception:
-        logger.exception("Delete callback failed")
-        bot.answer_callback_query(call.id, "Помилка.")
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("confirm_delete:"))
-def callback_confirm_delete(call):
-    uid = call.from_user.id
-    if not is_logged_in(uid):
-        bot.answer_callback_query(call.id, "Спочатку авторизуйся.")
-        return
-
-    try:
-        order_id = int(call.data.split(":", 1)[1])
-        success, result = delete_order_record(order_id, uid)
-        bot.answer_callback_query(call.id, "Готово" if success else "Відмовлено")
-        bot.send_message(call.message.chat.id, result)
-    except Exception:
-        logger.exception("Delete confirmation failed")
-        bot.answer_callback_query(call.id, "Не вдалося видалити.")
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "cancel_delete")
-def callback_cancel_delete(call):
-    bot.answer_callback_query(call.id, "Видалення скасовано.")
-    try:
-        bot.edit_message_reply_markup(
-            call.message.chat.id, call.message.message_id, reply_markup=None
-        )
-    except Exception:
-        pass
-def get_statistics(day=None):
-    day = day or now_local().strftime("%Y-%m-%d")
-    with db_connection() as conn:
-        orders = conn.execute("""
-            SELECT COUNT(*) AS total,
-                   SUM(CASE WHEN status='Надіслано' THEN 1 ELSE 0 END) AS sent,
-                   COALESCE(SUM(price),0) AS revenue
-            FROM orders WHERE substr(created_at,1,10)=?
-        """, (day,)).fetchone()
-
-        shifts = conn.execute("""
-            SELECT s.*, u.full_name, u.username
-            FROM shifts s LEFT JOIN users u ON u.user_id=s.user_id
-            WHERE s.shift_date=? ORDER BY s.start_time
-        """, (day,)).fetchall()
-
-    return {
-        "day": day,
-        "orders": int(orders["total"] or 0),
-        "sent": int(orders["sent"] or 0),
-        "revenue": float(orders["revenue"] or 0),
-        "shifts": shifts,
-    }
-
-
-def format_statistics(day=None):
-    stats = get_statistics(day)
-    lines = [
-        f"📊 <b>Статистика за {esc(stats['day'])}</b>",
-        f"Замовлень: <b>{stats['orders']}</b>",
-        f"Надіслано: <b>{stats['sent']}</b>",
-        f"Сума замовлень: <b>{stats['revenue']:.2f}</b>",
-        "",
-        "<b>Зміни:</b>",
-    ]
-
-    if not stats["shifts"]:
-        lines.append("Змін на цю дату немає.")
-    else:
-        for shift in stats["shifts"]:
-            name = shift["full_name"] or shift["username"] or str(shift["user_id"])
-            lines.append(
-                f"• {esc(name)}: {esc(shift['start_time'])}–{esc(shift['end_time'])}; "
-                f"статус: {esc(shift['status'])}"
-            )
-            if shift["actual_start"] or shift["actual_end"]:
-                lines.append(
-                    f"  Фактично: {esc(shift['actual_start'] or 'не почато')} – "
-                    f"{esc(shift['actual_end'] or 'ще триває')}"
-                )
-
-    return "\n".join(lines)
-
-
-@bot.message_handler(func=lambda m: m.text == "📊 Статистика")
-def handle_statistics(message):
-    uid = message.from_user.id
-    if not require_permission(message, "statistics"):
-        return
-
-    set_state(uid, "statistics_date", {})
-    bot.send_message(
-        message.chat.id,
-        "Введи дату у форматі YYYY-MM-DD або напиши «сьогодні»:",
-        reply_markup=cancel_keyboard(),
-    )
-
-
-@bot.message_handler(func=lambda m: get_state(m.from_user.id).get("state") == "statistics_date")
-def handle_statistics_date(message):
-    uid = message.from_user.id
-    raw = (message.text or "").strip().lower()
-
-    if raw == "сьогодні":
-        day = now_local().strftime("%Y-%m-%d")
-    else:
-        try:
-            day = datetime.strptime(raw, "%Y-%m-%d").strftime("%Y-%m-%d")
-        except ValueError:
-            bot.send_message(message.chat.id, "Неправильний формат. Приклад: 2026-10-23")
-            return
-
-    clear_state(uid)
-    bot.send_message(
-        message.chat.id,
-        format_statistics(day),
-        reply_markup=main_keyboard(uid),
-    )
-
-
-def get_user_shifts(user_id, include_history=True):
-    sql = "SELECT * FROM shifts WHERE user_id=?"
-    args = [user_id]
-    if not include_history:
-        sql += " AND shift_date>=?"
-        args.append(now_local().strftime("%Y-%m-%d"))
-    sql += " ORDER BY shift_date DESC,start_time DESC LIMIT 100"
-
-    with db_connection() as conn:
-        return conn.execute(sql, args).fetchall()
-
-
-def format_shift(shift):
-    return (
-        f"🗓 <b>Зміна #{shift['id']}</b>\n"
-        f"Дата: {esc(shift['shift_date'])}\n"
-        f"План: {esc(shift['start_time'])}–{esc(shift['end_time'])}\n"
-        f"Статус: {esc(shift['status'])}\n"
-        f"Початок фактично: {esc(shift['actual_start'] or 'не зафіксовано')}\n"
-        f"Кінець фактично: {esc(shift['actual_end'] or 'не зафіксовано')}"
-    )
-
-
-@bot.message_handler(func=lambda m: m.text == "🕒 Мої зміни")
-def handle_my_shifts(message):
-    uid = message.from_user.id
-    if not require_permission(message, "view_shifts"):
-        return
-
-    shifts = get_user_shifts(uid)
     if not shifts:
         bot.send_message(message.chat.id, "У тебе поки немає призначених змін.")
         return
@@ -1245,7 +1146,7 @@ def callback_shift_start(call):
 
         log_event("shift_started", uid, {"shift_id": shift_id})
         notify_owners(
-            f"▶️ Працівник <code>{uid}</code> почав зміну #{shift_id} о {esc(now_text())}."
+            f"▶️ {esc(user_label_by_id(uid))} почав зміну #{shift_id} о {esc(now_text())}."
         )
         bot.answer_callback_query(call.id, "Зміну розпочато.")
         bot.send_message(call.message.chat.id, "▶️ Зміну розпочато.")
@@ -1283,14 +1184,14 @@ def callback_shift_end(call):
 
         log_event("shift_ended", uid, {"shift_id": shift_id})
         notify_owners(
-            f"⏹ Працівник <code>{uid}</code> завершив зміну #{shift_id} о {esc(now_text())}."
+            f"⏹ {esc(user_label_by_id(uid))} завершив зміну #{shift_id} о {esc(now_text())}."
         )
         bot.answer_callback_query(call.id, "Зміну завершено.")
         bot.send_message(call.message.chat.id, "⏹ Зміну завершено.")
     except Exception:
         logger.exception("shift end failed")
         bot.answer_callback_query(call.id, "Не вдалося завершити зміну.")
-@bot.message_handler(func=lambda m: m.text == "🗓 Керування змінами")
+@bot.message_handler(func=lambda m: m.text in ("🗓 Керування змінами", "🗓 Призначити зміни"))
 def handle_manage_shifts(message):
     uid = message.from_user.id
     if not require_permission(message, "manage_shifts"):
@@ -1310,6 +1211,30 @@ def handle_manage_shifts(message):
         ))
     bot.send_message(message.chat.id, "Обери працівника для призначення зміни:", reply_markup=keyboard)
 
+
+@bot.message_handler(func=lambda m: m.text == "📅 Графік команди")
+def handle_team_schedule(message):
+    uid = message.from_user.id
+    if not require_permission(message, "manage_shifts"):
+        return
+    with db_connection() as conn:
+        shifts = conn.execute("""
+            SELECT s.*,u.username,u.full_name,u.display_name,u.role
+            FROM shifts s JOIN users u ON u.user_id=s.user_id
+            WHERE s.shift_date>=? AND s.status!='cancelled'
+            ORDER BY s.shift_date,s.start_time LIMIT 100
+        """, (now_local().strftime("%Y-%m-%d"),)).fetchall()
+    if not shifts:
+        bot.send_message(message.chat.id, "На майбутні дати змін поки немає.")
+        return
+    for shift in shifts:
+        name = user_label(shift)
+        keyboard = types.InlineKeyboardMarkup()
+        if shift["status"] == "planned":
+            keyboard.add(types.InlineKeyboardButton("❌ Скасувати зміну", callback_data=f"shift_cancel:{shift['id']}"))
+        bot.send_message(message.chat.id,
+            f"{format_shift(shift)}\nПрацівник: <b>{esc(name)}</b> · {esc(ROLE_LABELS.get(shift['role'], shift['role']))}",
+            reply_markup=keyboard if shift["status"] == "planned" else None)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("shift_assign:"))
 def callback_shift_assign(call):
@@ -1335,6 +1260,34 @@ def callback_shift_assign(call):
     except Exception:
         logger.exception("Shift assignment callback failed")
         bot.answer_callback_query(call.id, "Помилка.")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("shift_cancel:"))
+def callback_shift_cancel(call):
+    uid = call.from_user.id
+    if not is_logged_in(uid) or not has_permission(uid, "manage_shifts"):
+        bot.answer_callback_query(call.id, "Немає доступу.", show_alert=True)
+        return
+    try:
+        shift_id = int(call.data.split(":", 1)[1])
+        with db_connection() as conn:
+            shift = conn.execute("SELECT * FROM shifts WHERE id=?", (shift_id,)).fetchone()
+            if not shift:
+                bot.answer_callback_query(call.id, "Зміну не знайдено.", show_alert=True)
+                return
+            if shift["status"] != "planned":
+                bot.answer_callback_query(call.id, "Можна скасувати лише ще не розпочату зміну.", show_alert=True)
+                return
+            conn.execute("UPDATE shifts SET status='cancelled' WHERE id=? AND status='planned'", (shift_id,))
+        log_event("shift_cancelled", uid, {"shift_id": shift_id, "employee_id": int(shift["user_id"])})
+
+        delivered = notify_user(int(shift["user_id"]),
+            f"❌ <b>Зміну #{shift_id} скасовано</b>\nДата: {esc(shift['shift_date'])}\nЧас: {esc(shift['start_time'])}–{esc(shift['end_time'])}.")
+        bot.answer_callback_query(call.id, "Зміну скасовано.")
+        bot.send_message(call.message.chat.id, "Зміну скасовано." + (" Працівника повідомлено." if delivered else " Попередження: працівнику не вдалося надіслати повідомлення."))
+    except Exception:
+        logger.exception("Shift cancellation failed")
+        bot.answer_callback_query(call.id, "Не вдалося скасувати зміну.", show_alert=True)
 
 
 @bot.message_handler(func=lambda m: get_state(m.from_user.id).get("state") == "shift_date")
@@ -1401,6 +1354,13 @@ def handle_shift_end_time(message):
         employee_id = int(data["employee_id"])
         day = data["shift_date"]
         with db_connection() as conn:
+            overlap = conn.execute("""SELECT id FROM shifts
+                WHERE user_id=? AND shift_date=? AND status IN ('planned','started')
+                AND start_time < ? AND end_time > ? LIMIT 1""",
+                (employee_id, day, value, data["start_time"])).fetchone()
+            if overlap:
+                bot.send_message(message.chat.id, f"У працівника вже є зміна #{overlap['id']} у цей час. Нову зміну не створено.")
+                return
             cursor = conn.execute("""
                 INSERT INTO shifts (
                     user_id,shift_date,start_time,end_time,status,
@@ -1493,17 +1453,62 @@ def callback_user_manage(call):
                 "🔐 Права доступу",
                 callback_data=f"permissions:{target_id}"
             ))
+        keyboard.add(types.InlineKeyboardButton(
+            "✏️ Змінити ім'я в CRM",
+            callback_data=f"user_name:{target_id}"
+        ))
 
         bot.send_message(
             call.message.chat.id,
             format_user(target),
             reply_markup=keyboard
         )
+
         bot.answer_callback_query(call.id)
     except Exception:
         logger.exception("User management callback failed")
         bot.answer_callback_query(call.id, "Помилка.")
 
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("user_name:"))
+def callback_user_name(call):
+    uid = call.from_user.id
+    if not is_logged_in(uid) or not has_permission(uid, "manage_users"):
+        bot.answer_callback_query(call.id, "Немає доступу.")
+        return
+    try:
+        target_id = int(call.data.split(":", 1)[1])
+        if not get_user(target_id):
+            bot.answer_callback_query(call.id, "Користувача не знайдено.")
+            return
+        set_state(uid, "set_display_name", {"target_id": target_id})
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id,
+            "Введи ім'я, яке показуватиметься в CRM (до 60 символів).",
+            reply_markup=cancel_keyboard())
+    except Exception:
+        logger.exception("Display name callback failed")
+        bot.answer_callback_query(call.id, "Не вдалося відкрити редагування імені.")
+
+@bot.message_handler(func=lambda m: get_state(m.from_user.id).get("state") == "set_display_name")
+def handle_set_display_name(message):
+    uid = message.from_user.id
+    if not require_permission(message, "manage_users"):
+        return
+    name = (message.text or "").strip()
+    if not name or len(name) > 60:
+        bot.send_message(message.chat.id, "Ім'я має містити від 1 до 60 символів.")
+        return
+    target_id = int(get_state_data(uid).get("target_id", 0))
+    with db_connection() as conn:
+        cur = conn.execute("UPDATE users SET display_name=? WHERE user_id=?", (name, target_id))
+    if not cur.rowcount:
+        bot.send_message(message.chat.id, "Користувача не знайдено.")
+        return
+    clear_state(uid)
+    log_event("user_display_name_changed", uid, {"target_id": target_id, "display_name": name})
+    bot.send_message(message.chat.id, f"✅ Ім'я збережено: <b>{esc(name)}</b>",
+                     reply_markup=main_keyboard(uid))
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("user_block:"))
 def callback_user_block(call):
@@ -1641,6 +1646,7 @@ def callback_sos_confirm(call):
         incident_id = cursor.lastrowid
 
     clear_state(uid)
+
     log_event("sos_created", uid, {"incident_id": incident_id})
 
     user = get_user(uid)
@@ -1824,6 +1830,7 @@ def handle_tickets_list(message):
             reply_markup=keyboard,
         )
 
+    
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("ticket_reply:"))
 def callback_ticket_reply(call):
@@ -1942,24 +1949,91 @@ def callback_ticket_set_status(call):
     log_event("ticket_status_changed", uid, {"ticket_id": ticket_id, "status": status})
     bot.answer_callback_query(call.id, "Статус змінено.")
     bot.send_message(call.message.chat.id, f"Звернення #{ticket_id}: {esc(status)}")
-def ai_answer(user_id, question):
+
+
+def send_long_message(chat_id, text, reply_markup=None, limit=3900):
+    """Send long text in Telegram-safe chunks without cutting HTML entities."""
+    text = str(text or "")
+    if not text:
+        return bot.send_message(chat_id, " ")
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\\n", 0, limit)
+        if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip()
+    if text:
+        chunks.append(text)
+    sent = None
+    for index, chunk in enumerate(chunks):
+        sent = bot.send_message(chat_id, chunk, reply_markup=reply_markup if index == len(chunks)-1 else None)
+    return sent
+
+def get_ai_history(user_id, mode="assistant", limit=24):
+    with db_connection() as conn:
+        rows = conn.execute(
+            "SELECT role,content FROM ai_conversations WHERE user_id=? AND mode=? ORDER BY id DESC LIMIT ?",
+            (int(user_id), mode, int(limit))
+        ).fetchall()
+    return [{"role": row["role"], "content": row["content"]} for row in reversed(rows)]
+
+def save_ai_turn(user_id, mode, question, answer):
+    with db_connection() as conn:
+        conn.execute(
+            "INSERT INTO ai_conversations(user_id,mode,role,content,created_at) VALUES(?,?,?,?,?)",
+            (int(user_id), mode, "user", question, now_text())
+        )
+        conn.execute(
+            "INSERT INTO ai_conversations(user_id,mode,role,content,created_at) VALUES(?,?,?,?,?)",
+            (int(user_id), mode, "assistant", answer, now_text())
+        )
+
+
+def clear_ai_history(user_id, mode=None):
+    with db_connection() as conn:
+        if mode:
+            conn.execute("DELETE FROM ai_conversations WHERE user_id=? AND mode=?", (int(user_id), mode))
+        else:
+            conn.execute("DELETE FROM ai_conversations WHERE user_id=?", (int(user_id),))
+
+def ai_answer(user_id, question, mode="assistant"):
     if not OPENAI_API_KEY:
         return "AI-помічник не налаштований: додай OPENAI_API_KEY у змінні Render."
-
     try:
         from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
+        client = OpenAI(api_key=OPENAI_API_KEY, timeout=45.0, max_retries=2)
+        history = get_ai_history(user_id, mode, limit=100)
+        history.append({"role": "user", "content": question[:12000]})
+        instructions = (
+            "Ти AI-помічник українського вейпшопу Haimer Brend Shop (HBS), а не лише CRM. "
+            "Допомагай із товарами вейпшопу, поясненнями характеристик, сервісом клієнтів, "
+            "роботою магазину, продажами, маркетингом, текстами для соцмереж, організацією "
+            "команди та загальними питаннями користувача. Не стверджуй, що знаєш актуальний "
+            "асортимент, ціни, залишки, адресу, доставку чи правила магазину, якщо вони не "
+            "передані в контексті або не перевірені в інтернеті. Коли потрібна актуальна "
+
+            "інформація, використовуй веб-пошук, якщо він доступний, і відділяй перевірені "
+            "факти від припущень. Відповідай природно, доброзичливо, прямо та без зайвих "
+            "відмов; якщо запит безпечний, допомагай максимально практично. Дотримуйся "
+            "законодавства та правил безпеки, зокрема щодо вікових обмежень на нікотинові "
+            "товари; не допомагай обходити перевірку віку чи продавати заборонені товари. "
+            "Не вигадуй дані CRM і не стверджуй, що маєш доступ до бази чи інтернету, якщо "
+            "інструмент недоступний. Ніколи не проси паролі, токени або API-ключі. "
+            "Підтримуй довгий багатокроковий діалог: використовуй попередню історію, "
+            "пам'ятай контекст розмови та уточнюй лише те, що справді потрібно."
+        )
         response = client.responses.create(
             model=OPENAI_MODEL,
-            instructions=(
-                "Ти помічник Cloud Hub CRM. Відповідай українською, чітко та стисло. "
-                "Не вигадуй замовлення, суми, користувачів або статистику. "
-                "Ти не маєш прямого доступу до бази CRM через цей запит. "
-                "Не проси паролі, токени чи інші секрети."
-            ),
-            input=question,
+            instructions=instructions,
+            input=history,
+            tools=[{"type": "web_search"}],
         )
-        return response.output_text or "Не вдалося сформувати відповідь."
+        answer = response.output_text or "Не вдалося сформувати відповідь."
+        save_ai_turn(user_id, mode, question[:12000], answer[:20000])
+        return answer
     except Exception:
         logger.exception("AI request failed for user %s", user_id)
         return "AI тимчасово недоступний. Перевір ключ API, модель і журнал Render."
@@ -1986,8 +2060,8 @@ def handle_ai_question(message):
         bot.send_message(message.chat.id, "Напиши запитання.")
         return
     answer = ai_answer(uid, question)
-    bot.send_message(message.chat.id, esc(answer)[:4000], reply_markup=main_keyboard(uid))
-    clear_state(uid)
+    send_long_message(message.chat.id, esc(answer), reply_markup=cancel_keyboard())
+    # Keep AI state active for a multi-turn conversation until /cancel or Home.
 
 
 @bot.message_handler(func=lambda m: m.text == "💬 Психологічна підтримка")
@@ -2076,14 +2150,16 @@ def handle_psych_question(message):
             model=OPENAI_MODEL,
             instructions=(
                 "Ти уважний помічник емоційної підтримки. Відповідай українською, "
-                "співчутливо та без осуду. Не став діагнозів, не призначай ліків. "
-                "Якщо є ризик самоушкодження, заохочуй звернутися до людини поруч "
-                "та місцевої екстреної допомоги."
+                "співчутливо та без осуду. Не став діагнозів і не призначай ліків. "
+                "Підтримуй тривалий діалог, враховуй попередні репліки. Якщо є ризик "
+                "самоушкодження, заохочуй звернутися до людини поруч та місцевої екстреної допомоги."
             ),
-            input=text,
+            input=get_ai_history(uid, "psychologist", limit=100) + [{"role": "user", "content": text[:12000]}],
+            tools=[{"type": "web_search"}],
         )
         answer = response.output_text or "Не вдалося сформувати відповідь."
-        bot.send_message(message.chat.id, esc(answer)[:4000])
+        save_ai_turn(uid, "psychologist", text[:12000], answer[:20000])
+        send_long_message(message.chat.id, esc(answer))
     except Exception:
         logger.exception("Psychology assistant failed")
         bot.send_message(message.chat.id, "Зараз не вдалося отримати відповідь. Спробуй пізніше.")
@@ -2095,12 +2171,11 @@ def handle_broadcast_start(message):
     if not require_permission(message, "broadcast"):
         return
 
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(
-        types.InlineKeyboardButton("Усім користувачам", callback_data="broadcast_role:all"),
-        types.InlineKeyboardButton("Працівникам", callback_data="broadcast_role:staff"),
-        types.InlineKeyboardButton("Менеджерам", callback_data="broadcast_role:manager"),
-    )
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(types.InlineKeyboardButton("Усім користувачам", callback_data="broadcast_role:all"))
+    for role in ("owner", "manager", "staff", "collector", "shipper"):
+        keyboard.add(types.InlineKeyboardButton(ROLE_LABELS[role], callback_data=f"broadcast_role:{role}"))
+    keyboard.add(types.InlineKeyboardButton("👤 Окремим людям", callback_data="broadcast_role:individual"))
     bot.send_message(message.chat.id, "Обери отримувачів розсилки:", reply_markup=keyboard)
 
 
@@ -2112,13 +2187,57 @@ def callback_broadcast_role(call):
         return
 
     role = call.data.split(":", 1)[1]
+    if role not in ("all", "individual", *ROLES):
+        bot.answer_callback_query(call.id, "Невідомий тип отримувачів.", show_alert=True)
+        return
+    if role == "individual":
+        set_state(uid, "broadcast_recipients", {})
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id,
+            "Введи ID, @username або відображуване ім’я отримувачів через кому. "
+            "Бот знайде лише користувачів, які вже авторизувалися.", reply_markup=cancel_keyboard())
+        return
+
     set_state(uid, "broadcast_message", {"role": role})
     bot.answer_callback_query(call.id)
-    bot.send_message(
-        call.message.chat.id,
+    bot.send_message(call.message.chat.id,
         "Введи текст розсилки. Відправлення почнеться після підтвердження.",
-        reply_markup=cancel_keyboard(),
-    )
+        reply_markup=cancel_keyboard())
+
+
+@bot.message_handler(func=lambda m: get_state(m.from_user.id).get("state") == "broadcast_recipients")
+def handle_broadcast_recipients(message):
+    uid = message.from_user.id
+    if not is_logged_in(uid) or not has_permission(uid, "broadcast"):
+        clear_state(uid)
+        bot.send_message(message.chat.id, "⛔ Немає доступу до розсилок.")
+        return
+    tokens = [x.strip().lstrip("@") for x in (message.text or "").split(",") if x.strip()]
+    if not tokens:
+        bot.send_message(message.chat.id, "Вкажи хоча б одного отримувача.")
+        return
+    with db_connection() as conn:
+        rows = conn.execute("SELECT user_id,username,full_name,display_name FROM users WHERE role!='' AND is_blocked=0").fetchall()
+    found = []
+    missing = []
+    for token in tokens:
+        matches = []
+        for row in rows:
+            vals = {str(row["user_id"]), str(row["username"] or "").lstrip("@"),
+                    str(row["full_name"] or "").casefold(), str(row["display_name"] or "").casefold()}
+            if token.casefold() in vals:
+                matches.append(int(row["user_id"]))
+        if matches:
+            found.extend(matches)
+        else:
+            missing.append(token)
+    found = sorted(set(found))
+    if not found:
+        bot.send_message(message.chat.id, "Не знайшов активних авторизованих отримувачів. Перевір ID, username або ім’я.")
+        return
+    set_state(uid, "broadcast_message", {"role": "individual", "recipients": found})
+    extra = ("\nНе знайдено: " + ", ".join(esc(x) for x in missing)) if missing else ""
+    bot.send_message(message.chat.id, f"Знайдено отримувачів: {len(found)}.{extra}\nТепер введи текст розсилки.", reply_markup=cancel_keyboard())
 
 
 @bot.message_handler(func=lambda m: get_state(m.from_user.id).get("state") == "broadcast_message")
@@ -2131,17 +2250,16 @@ def handle_broadcast_message(message):
 
     state = get_state(uid)
     role = state.get("data", {}).get("role", "all")
-    with db_connection() as conn:
-        if role == "all":
-            rows = conn.execute(
-                "SELECT user_id FROM users WHERE role!='' AND is_blocked=0"
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT user_id FROM users WHERE role=? AND is_blocked=0", (role,)
-            ).fetchall()
-
-    recipients = [int(row["user_id"]) for row in rows]
+    selected = state.get("data", {}).get("recipients") if role == "individual" else None
+    if selected is not None:
+        recipients = [int(x) for x in selected]
+    else:
+        with db_connection() as conn:
+            if role == "all":
+                rows = conn.execute("SELECT user_id FROM users WHERE role!='' AND is_blocked=0").fetchall()
+            else:
+                rows = conn.execute("SELECT user_id FROM users WHERE role=? AND is_blocked=0", (role,)).fetchall()
+        recipients = [int(row["user_id"]) for row in rows]
     set_state(uid, "broadcast_confirm", {"role": role, "content": content, "recipients": recipients})
 
     keyboard = types.InlineKeyboardMarkup()
@@ -2201,7 +2319,11 @@ def callback_broadcast_confirm(call):
 
 @bot.callback_query_handler(func=lambda c: c.data == "broadcast_cancel")
 def callback_broadcast_cancel(call):
-    clear_state(call.from_user.id)
+    uid = call.from_user.id
+    if not is_logged_in(uid) or not has_permission(uid, "broadcast"):
+        bot.answer_callback_query(call.id, "Немає доступу.")
+        return
+    clear_state(uid)
     bot.answer_callback_query(call.id, "Розсилку скасовано.")
     bot.send_message(call.message.chat.id, "Розсилку скасовано.")
 
@@ -2259,7 +2381,7 @@ def callback_permission_toggle(call):
         logger.exception("Permission toggle failed")
         bot.answer_callback_query(call.id, "Не вдалося змінити право.")
 
-
+ 
 def callback_permissions_refresh(message, uid, target_id):
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     for permission, label in PERMISSIONS.items():
@@ -2285,14 +2407,72 @@ def validate_configuration():
         logger.warning("CRM_PASSWORD_OWNER is not configured.")
 
 
+def send_daily_order_reminders(current):
+    """Retry the daily 18:00 report until every eligible recipient receives it."""
+    if current.hour < 18:
+        return
+    day = current.strftime("%Y-%m-%d")
+    with db_connection() as conn:
+        uncollected = conn.execute(
+            "SELECT * FROM orders WHERE status IN ('Не зібрано','Нове','new') ORDER BY created_at,id"
+        ).fetchall()
+        awaiting_ttn = conn.execute(
+            "SELECT * FROM orders WHERE status IN ('Зібрано','Зібрано без ТТН') AND COALESCE(ttn,'')='' ORDER BY created_at,id"
+        ).fetchall()
+        recipients = conn.execute(
+            "SELECT user_id,role FROM users WHERE is_blocked=0 AND role IN ('collector','shipper')"
+        ).fetchall()
+        for row in recipients:
+            conn.execute("INSERT OR IGNORE INTO daily_report_delivery(report_date,user_id,status) VALUES(?,?,'pending')",
+                         (day, int(row['user_id'])))
+        delivery_rows = conn.execute(
+            "SELECT user_id,status FROM daily_report_delivery WHERE report_date=?", (day,)
+        ).fetchall()
+    if not recipients:
+        return
+    lines = [f"📦 <b>Щоденний контроль замовлень · {esc(day)}</b>",
+             f"Не зібрано: <b>{len(uncollected)}</b>"]
+    for order in uncollected[:50]:
+        lines.append(f"• #{esc(order['order_number'] or order['id'])} · {esc(order['full_name'])} · {esc(order['city'])}")
+    if len(uncollected) > 50:
+        lines.append(f"… та ще {len(uncollected)-50} замовлень")
+    shipped_lines = [f"Зібрано без ТТН: <b>{len(awaiting_ttn)}</b>"]
+    for order in awaiting_ttn[:50]:
+        shipped_lines.append(f"• #{esc(order['order_number'] or order['id'])} · {esc(order['full_name'])} · ТТН відсутня")
+    if len(awaiting_ttn) > 50:
+        shipped_lines.append(f"… та ще {len(awaiting_ttn)-50} замовлень")
+    already_sent = {int(r['user_id']) for r in delivery_rows if r['status'] == 'sent'}
+    for row in recipients:
+        recipient_id, role = int(row['user_id']), row['role']
+        if recipient_id in already_sent:
+            continue
+        parts = lines if role == 'collector' else lines + shipped_lines
+        message = "\n".join(parts)
+        ok = notify_user(recipient_id, message)
+        with db_connection() as conn:
+            conn.execute("""UPDATE daily_report_delivery
+                SET status=?, attempts=attempts+1, last_attempt=?, last_error=?
+                WHERE report_date=? AND user_id=?""",
+                ('sent' if ok else 'pending', now_text(), '' if ok else 'Telegram delivery failed', day, recipient_id))
+    with db_connection() as conn:
+        pending = conn.execute("SELECT COUNT(*) FROM daily_report_delivery WHERE report_date=? AND status!='sent'", (day,)).fetchone()[0]
+        if pending == 0:
+            conn.execute("INSERT INTO daily_report_log(report_date,sent_at,pending_count) VALUES(?,?,?) ON CONFLICT(report_date) DO UPDATE SET sent_at=excluded.sent_at,pending_count=excluded.pending_count",
+                         (day, now_text(), len(uncollected)+len(awaiting_ttn)))
+    log_event("daily_order_reminder_attempt", None, {
+        "date": day, "recipients": len(recipients), "pending_delivery": pending,
+        "uncollected": len(uncollected), "awaiting_ttn": len(awaiting_ttn)
+    })
+
 def reminder_worker():
     while not stop_event.is_set():
         try:
             current = now_local()
+            send_daily_order_reminders(current)
             with db_connection() as conn:
                 shifts = conn.execute("""
                     SELECT * FROM shifts
-                    WHERE shift_date>=? AND status='planned'
+                    WHERE shift_date>=? AND status IN ('planned','started')
                 """, (current.strftime("%Y-%m-%d"),)).fetchall()
 
             for shift in shifts:
@@ -2311,10 +2491,20 @@ def reminder_worker():
                 ]
 
                 for flag, when, label in reminders:
-                    if not shift[flag] and when <= current <= when + timedelta(minutes=2):
+                    if flag == "reminder_5_end" and shift["status"] != "started":
+                        continue
+                    if flag != "reminder_5_end" and shift["status"] != "planned":
+                        continue
+                    if not shift[flag] and when <= current:
+                        keyboard = types.InlineKeyboardMarkup()
+                        if flag == "reminder_5_start":
+                            keyboard.add(types.InlineKeyboardButton("▶️ Відкрити зміну", callback_data=f"shift_start:{shift['id']}"))
+                        elif flag == "reminder_5_end":
+                            keyboard.add(types.InlineKeyboardButton("⏹ Закрити зміну", callback_data=f"shift_end:{shift['id']}"))
                         ok = notify_user(
                             shift["user_id"],
-                            f"⏰ {label} твоя зміна #{shift['id']} ({esc(day)})."
+                            f"⏰ {label} твоя зміна #{shift['id']} ({esc(day)}).",
+                            keyboard if flag in ("reminder_5_start", "reminder_5_end") else None
                         )
                         if ok:
                             with db_connection() as conn:
