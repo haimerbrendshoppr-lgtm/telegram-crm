@@ -28,165 +28,7 @@ if not DB_PATH:
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML", threaded=True)
 
-# ---------------------------------------------------------------------------
-# Reply-keyboard action bridge
-# All former inline-button menus are converted to ordinary Telegram reply
-# keyboards. Pressing a button routes its callback_data to the original
-# callback handler, preserving the existing business logic and permissions.
-# ---------------------------------------------------------------------------
-from collections import OrderedDict
-from types import SimpleNamespace
-
-_reply_action_lock = threading.RLock()
-_reply_actions = {}          # chat/user id -> OrderedDict(button text -> callback data)
-_reply_action_limit = 36
-_reply_callback_prefix = "reply-action-"
-_original_send_message = bot.send_message
-_original_answer_callback_query = bot.answer_callback_query
-_original_edit_message_reply_markup = bot.edit_message_reply_markup
-
-
-def _reply_action_suffix(callback_data):
-    parts = str(callback_data or "").split(":")
-    numeric = [part for part in parts[1:] if part.isdigit()]
-    if numeric:
-        return "#" + numeric[-1]
-    if len(parts) > 1 and parts[-1]:
-        return parts[-1][:12]
-    return "дія"
-
-
-def _make_reply_action_label(label, callback_data, actions):
-    label = str(label or "Дія").strip() or "Дія"
-    if len(label) > 48:
-        label = label[:45] + "..."
-    if label not in actions or actions.get(label) == callback_data:
-        return label
-    suffix = " · " + _reply_action_suffix(callback_data)
-    candidate = label[:max(1, 64-len(suffix))] + suffix
-    counter = 2
-    while candidate in actions and actions[candidate] != callback_data:
-        extra = f" ({counter})"
-        candidate = label[:max(1, 64-len(suffix)-len(extra))] + suffix + extra
-        counter += 1
-    return candidate
-
-
-def _convert_inline_to_reply(chat_id, inline_markup):
-    rows = getattr(inline_markup, "keyboard", None) or []
-    if not rows:
-        return inline_markup
-    with _reply_action_lock:
-        actions = _reply_actions.setdefault(int(chat_id), OrderedDict())
-        current_labels = []
-        for row in rows:
-            for button in row:
-                callback_data = getattr(button, "callback_data", None)
-                if callback_data is None:
-                    # URL / login / switch-inline buttons cannot be executed
-                    # as normal reply-keyboard actions, so don't fake them.
-                    continue
-                label = _make_reply_action_label(getattr(button, "text", "Дія"), callback_data, actions)
-                actions[label] = str(callback_data)
-                actions.move_to_end(label)
-                current_labels.append(label)
-        while len(actions) > _reply_action_limit:
-            actions.popitem(last=False)
-        # Show the most recently offered actions together. This is necessary
-        # because a reply keyboard belongs to the chat, not to an individual
-        # message like an inline keyboard does.
-        keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-        visible = list(actions.keys())
-        for index in range(0, len(visible), 2):
-            keyboard.row(*[types.KeyboardButton(label) for label in visible[index:index+2]])
-        keyboard.row(types.KeyboardButton("❌ Скасувати"), types.KeyboardButton("🏠 Головне меню"))
-        return keyboard
-
-
-def _send_message_reply_bridge(*args, **kwargs):
-    # Most calls use reply_markup as a keyword. Also handle positional callers.
-    reply_markup = kwargs.get("reply_markup")
-    if reply_markup is None and len(args) > 9:
-        reply_markup = args[9]
-    if isinstance(reply_markup, types.InlineKeyboardMarkup):
-        chat_id = kwargs.get("chat_id", args[0] if args else None)
-        if chat_id is not None:
-            converted = _convert_inline_to_reply(chat_id, reply_markup)
-            if "reply_markup" in kwargs:
-                kwargs["reply_markup"] = converted
-            elif len(args) > 9:
-                args = list(args)
-                args[9] = converted
-                args = tuple(args)
-            else:
-                kwargs["reply_markup"] = converted
-    return _original_send_message(*args, **kwargs)
-
-
-bot.send_message = _send_message_reply_bridge
-
-
-def _answer_callback_query_reply_bridge(callback_query_id, *args, **kwargs):
-    if str(callback_query_id).startswith(_reply_callback_prefix):
-        return True
-    return _original_answer_callback_query(callback_query_id, *args, **kwargs)
-
-
-bot.answer_callback_query = _answer_callback_query_reply_bridge
-
-
-def _edit_message_reply_markup_reply_bridge(*args, **kwargs):
-    # Inline messages no longer exist; removing their markup is unnecessary.
-    # The user-facing reply keyboard remains available.
-    return None
-
-
-bot.edit_message_reply_markup = _edit_message_reply_markup_reply_bridge
-
-
-def _is_reply_action_button(message):
-    if not getattr(message, "text", None) or not getattr(message, "from_user", None):
-        return False
-    with _reply_action_lock:
-        return message.text in _reply_actions.get(int(message.from_user.id), {})
-
-
-@bot.message_handler(func=_is_reply_action_button, content_types=["text"])
-def dispatch_reply_action(message):
-    uid = int(message.from_user.id)
-    label = (message.text or "").strip()
-    with _reply_action_lock:
-        callback_data = _reply_actions.get(uid, {}).get(label)
-    if not callback_data:
-        return
-    synthetic_call = SimpleNamespace(
-        id=_reply_callback_prefix + str(getattr(message, "message_id", time.time_ns())),
-        from_user=message.from_user,
-        message=message,
-        data=callback_data,
-        json={},
-        chat_instance="reply-keyboard",
-    )
-    # Callback handlers are registered later during module import, so look
-    # them up at click time. Apply their original predicates before dispatch.
-    for handler in getattr(bot, "callback_query_handlers", []):
-        filters = handler.get("filters", {})
-        predicate = filters.get("func")
-        try:
-            if predicate is not None and not predicate(synthetic_call):
-                continue
-            function = handler.get("function")
-            if function is None:
-                continue
-            function(synthetic_call)
-            return
-        except Exception:
-            logger.exception("Reply-keyboard action failed: %s", callback_data)
-            bot.send_message(message.chat.id,
-                             "Не вдалося виконати дію. Спробуй ще раз або звернися до адміністратора.")
-            return
-    logger.warning("No callback handler matched reply action: %s", callback_data)
-    bot.send_message(message.chat.id, "Ця дія більше недоступна. Відкрий потрібний розділ ще раз.")
+# InlineKeyboardMarkup is intentionally left native: Telegram buttons stay attached to each order card.
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
                     format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("cloud_hub_crm")
@@ -448,6 +290,15 @@ def init_db():
             category TEXT DEFAULT '',
             created_at TEXT DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS staff_reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_by INTEGER NOT NULL,
+            reminder_time TEXT NOT NULL,
+            message TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            last_sent_date TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
         """)
         # Add missing columns to older installations without deleting records.
         migrations = {
@@ -640,6 +491,7 @@ def main_keyboard(user_id):
         options.append("📅 Графік команди")
     if has_permission(user_id, "broadcast"):
         options.append("📣 Розсилка")
+        options.append("⏰ Нагадування команди")
     if has_permission(user_id, "use_ai"):
         options.append("🤖 AI-помічник")
     if has_permission(user_id, "use_psychologist"):
@@ -718,19 +570,47 @@ def order_summary(order):
         f"Створено: {esc(order['created_at'])}"
     )
 
+def order_keyboard(order, user_id):
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    role = get_role(user_id)
+    can_manage_all = role == "owner" or has_permission(user_id, "manage_order_status")
+    can_change_status = can_manage_all or role in ("collector", "shipper")
+    can_manage_ttn = role in ("owner", "manager", "shipper") or has_permission(user_id, "manage_users")
+
+    buttons = []
+    if can_change_status:
+        buttons.append(types.InlineKeyboardButton(
+            "🔄 Змінити статус", callback_data=f"order_status:{order['id']}"
+        ))
+    if can_manage_ttn:
+        buttons.append(types.InlineKeyboardButton(
+            "🧾 Додати/змінити ТТН", callback_data=f"order_ttn:{order['id']}"
+        ))
+    if buttons:
+        keyboard.row(*buttons)
+    if can_delete_order(user_id, order):
+        keyboard.add(types.InlineKeyboardButton("🗑 Видалити", callback_data=f"order_delete:{order['id']}"))
+    return keyboard
+
+
 def orders_page(query=None, unsent=False, limit=50):
     sql = "SELECT * FROM orders"
     clauses, args = [], []
     if unsent:
-        clauses.append("status NOT IN ('Надіслано','Скасовано')")
+        # Ненадіслані = без ТТН і ще не відправлені/скасовані.
+        # COALESCE враховує старі записи з NULL або порожнім статусом.
+        clauses.append("COALESCE(NULLIF(TRIM(status), ''), 'Нове') NOT IN ('Надіслано','Скасовано')")
+        clauses.append("COALESCE(TRIM(ttn), '') = ''")
     if query:
         clauses.append("(order_number LIKE ? OR full_name LIKE ? OR phone LIKE ?)")
         pattern = f"%{query}%"
         args.extend([pattern, pattern, pattern])
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
-    sql += " ORDER BY id DESC LIMIT ?"
-    args.append(int(limit))
+    sql += " ORDER BY id DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        args.append(int(limit))
     with db_connection() as conn:
         return conn.execute(sql, args).fetchall()
 def create_order_record(user_id, data):
@@ -782,11 +662,12 @@ def update_order_status(order_id, status, user_id):
     role = get_role(user_id)
     if role == "owner":
         allowed = True
-    elif status == "Зібрано":
+    elif status in ("Зібрано", "Не зібрано"):
+        # Збирач може виставити обидва результати збору.
         allowed = role == "collector" or has_permission(user_id, "manage_order_status")
     elif status == "Надіслано":
         allowed = role == "shipper" or has_permission(user_id, "manage_order_status")
-    elif status in ("Нове", "В роботі", "Не зібрано", "Скасовано"):
+    elif status in ("Нове", "В роботі", "Скасовано"):
         allowed = has_permission(user_id, "manage_order_status")
     else:
         allowed = False
@@ -810,20 +691,18 @@ def update_order_status(order_id, status, user_id):
 
 def update_order_ttn(order_id, ttn, user_id):
     ttn = str(ttn or "").strip()
-    if not ttn:
-        raise ValueError("ТТН не може бути порожньою.")
+    if not ttn or ttn == ".":
+        raise ValueError("Введи коректну ТТН, а не порожнє значення.")
+    if not is_logged_in(user_id):
+        raise PermissionError("Потрібна авторизація.")
+    if get_role(user_id) not in ("owner", "manager", "shipper") and not has_permission(user_id, "manage_users"):
+        raise PermissionError("Немає права додавати ТТН.")
     with db_connection() as conn:
-        order = conn.execute(
-            "SELECT id,status FROM orders WHERE id=?", (order_id,)
-        ).fetchone()
+        order = conn.execute("SELECT id FROM orders WHERE id=?", (order_id,)).fetchone()
         if not order:
             return False
-        if order["status"] not in ("Зібрано", "В роботі", "Надіслано"):
-            raise PermissionError("Спочатку збирач має позначити замовлення «Зібрано».")
-        conn.execute(
-            "UPDATE orders SET ttn=? WHERE id=?",
-            (ttn, order_id),
-        )
+        # Додавання ТТН не змінює статус автоматично.
+        conn.execute("UPDATE orders SET ttn=? WHERE id=?", (ttn, order_id))
 
     audit_order_action(user_id, "ttn_updated", order_id)
     return True
@@ -868,28 +747,18 @@ def show_orders(chat_id, user_id, unsent=False, query=None):
         bot.send_message(chat_id, "⛔ Немає доступу до пошуку.")
         return
 
-    orders = orders_page(query=query, unsent=unsent, limit=50)
+    orders = orders_page(query=query, unsent=unsent, limit=None if unsent else 50)
     if not orders:
         bot.send_message(chat_id, "Замовлень не знайдено.")
         return
 
     for order in orders:
-        keyboard = types.InlineKeyboardMarkup(row_width=2)
-        keyboard.add(
-            types.InlineKeyboardButton(
-                "🔄 Статус", callback_data=f"order_status:{order['id']}"
-            ),
-            types.InlineKeyboardButton(
-                "🧾 Додати ТТН", callback_data=f"order_ttn:{order['id']}"
-            ),
-        )
-        if can_delete_order(user_id, order):
-            keyboard.add(types.InlineKeyboardButton(
-                "🗑 Видалити", callback_data=f"order_delete:{order['id']}"
-            ))
-        bot.send_message(
-            chat_id, order_summary(order), reply_markup=keyboard
-        )
+        try:
+            bot.send_message(
+                chat_id, order_summary(order), reply_markup=order_keyboard(order, user_id)
+            )
+        except Exception:
+            logger.exception("Could not send order card id=%s to chat=%s", order["id"], chat_id)
 
 
 def begin_order_creation(message):
@@ -962,26 +831,6 @@ def finish_order_creation(message):
     state = get_state(uid)
     if state.get("state") != "note":
         return False
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     data = dict(state.get("data", {}))
     note = (message.text or "").strip()
@@ -1174,24 +1023,40 @@ def callback_order_status(call):
         bot.answer_callback_query(call.id, "Спочатку авторизуйся.")
         return
 
-    order_id = int(call.data.split(":", 1)[1])
-    order = get_order(order_id)
-    if not order:
-        bot.answer_callback_query(call.id, "Замовлення не знайдено.")
-        return
+    try:
+        order_id = int(call.data.split(":", 1)[1])
+        order = get_order(order_id)
+        if not order:
+            bot.answer_callback_query(call.id, "Замовлення не знайдено.")
+            return
+        if not (has_permission(uid, "view_all_orders") or has_permission(uid, "view_unsent_orders")):
+            bot.answer_callback_query(call.id, "Немає доступу.")
+            return
 
-    if not (has_permission(uid, "view_all_orders") or
-            has_permission(uid, "view_unsent_orders")):
-        bot.answer_callback_query(call.id, "Немає доступу.")
-        return
-
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
-    for status in ORDER_STATUSES:
-        keyboard.add(types.InlineKeyboardButton(
-            status, callback_data=f"set_status:{order_id}:{status}"
-        ))
-    bot.send_message(call.message.chat.id, "Обери новий статус:", reply_markup=keyboard)
-    bot.answer_callback_query(call.id)
+        keyboard = types.InlineKeyboardMarkup(row_width=2)
+        role = get_role(uid)
+        can_manage_all = role == "owner" or has_permission(uid, "manage_order_status")
+        allowed_statuses = []
+        for status in ORDER_STATUSES:
+            if can_manage_all:
+                allowed_statuses.append(status)
+            elif status in ("Зібрано", "Не зібрано") and role == "collector":
+                allowed_statuses.append(status)
+            elif status == "Надіслано" and role == "shipper":
+                allowed_statuses.append(status)
+        for status in allowed_statuses:
+            keyboard.add(types.InlineKeyboardButton(
+                status, callback_data=f"set_status:{order_id}:{status}"
+            ))
+        keyboard.add(types.InlineKeyboardButton("⬅️ Назад до замовлення", callback_data=f"order_refresh:{order_id}"))
+        bot.edit_message_text(
+            f"🔄 <b>Зміна статусу замовлення #{order_id}</b>\nПоточний статус: {esc(order['status'])}",
+            call.message.chat.id, call.message.message_id, reply_markup=keyboard
+        )
+        bot.answer_callback_query(call.id)
+    except Exception:
+        logger.exception("Order status menu failed")
+        bot.answer_callback_query(call.id, "Не вдалося відкрити статуси.", show_alert=True)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("set_status:"))
@@ -1207,8 +1072,13 @@ def callback_set_status(call):
         if not update_order_status(order_id, status, uid):
             bot.answer_callback_query(call.id, "Замовлення не знайдено.")
             return
+        order = get_order(order_id)
+        if order:
+            bot.edit_message_text(
+                order_summary(order), call.message.chat.id, call.message.message_id,
+                reply_markup=order_keyboard(order, uid)
+            )
         bot.answer_callback_query(call.id, "Статус оновлено.")
-        bot.send_message(call.message.chat.id, f"✅ Статус замовлення #{order_id}: {esc(status)}")
     except PermissionError as exc:
         bot.answer_callback_query(call.id, str(exc)[:180], show_alert=True)
     except ValueError as exc:
@@ -1216,6 +1086,26 @@ def callback_set_status(call):
     except Exception:
         logger.exception("Status update failed")
         bot.answer_callback_query(call.id, "Не вдалося змінити статус.", show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("order_refresh:"))
+def callback_order_refresh(call):
+    uid = call.from_user.id
+    try:
+        order_id = int(call.data.split(":", 1)[1])
+        order = get_order(order_id)
+        if not order:
+            bot.answer_callback_query(call.id, "Замовлення не знайдено.")
+            return
+        if not (has_permission(uid, "view_all_orders") or has_permission(uid, "view_unsent_orders")):
+            bot.answer_callback_query(call.id, "Немає доступу.")
+            return
+        bot.edit_message_text(order_summary(order), call.message.chat.id,
+                              call.message.message_id, reply_markup=order_keyboard(order, uid))
+        bot.answer_callback_query(call.id)
+    except Exception:
+        logger.exception("Order refresh failed")
+        bot.answer_callback_query(call.id, "Не вдалося оновити замовлення.", show_alert=True)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("order_ttn:"))
@@ -1233,7 +1123,7 @@ def callback_order_ttn(call):
         if not get_order(order_id):
             bot.answer_callback_query(call.id, "Замовлення не знайдено.")
             return
-        set_state(uid, "order_ttn", {"order_id": order_id})
+        set_state(uid, "order_ttn", {"order_id": order_id, "source_message_id": call.message.message_id})
         bot.send_message(
             call.message.chat.id,
             f"Введи ТТН для замовлення #{order_id}:",
@@ -1249,24 +1139,47 @@ def callback_order_ttn(call):
 def handle_order_ttn_input(message):
     uid = message.from_user.id
     state = get_state(uid)
-    order_id = state.get("data", {}).get("order_id")
+    data = state.get("data", {})
+    order_id = data.get("order_id")
+    source_message_id = data.get("source_message_id")
     ttn = (message.text or "").strip()
 
-    if not ttn:
-        bot.send_message(message.chat.id, "ТТН не може бути порожньою.")
-        return
-
-    if not update_order_ttn(order_id, ttn, uid):
-        bot.send_message(message.chat.id, "Замовлення не знайдено.")
+    if cancel_or_home(ttn):
         clear_state(uid)
+        bot.send_message(message.chat.id, "Дію скасовано.", reply_markup=main_keyboard(uid))
+        return
+    if not ttn or ttn == ".":
+        bot.send_message(message.chat.id, "Введи коректну ТТН. Для скасування натисни «❌ Скасувати».", reply_markup=cancel_keyboard())
         return
 
-    clear_state(uid)
-    bot.send_message(
-        message.chat.id,
-        f"✅ ТТН для замовлення #{order_id} збережено.",
-        reply_markup=main_keyboard(uid),
-    )
+    try:
+        if not update_order_ttn(order_id, ttn, uid):
+            bot.send_message(message.chat.id, "Замовлення не знайдено.")
+            clear_state(uid)
+            return
+        clear_state(uid)
+        order = get_order(order_id)
+        if order and source_message_id:
+            try:
+                bot.edit_message_text(order_summary(order), message.chat.id,
+                                      source_message_id, reply_markup=order_keyboard(order, uid))
+            except Exception:
+                logger.exception("Could not refresh order card after TTN update")
+                bot.send_message(message.chat.id, order_summary(order), reply_markup=order_keyboard(order, uid))
+        bot.send_message(
+            message.chat.id,
+            f"✅ ТТН для замовлення #{order_id} збережено. Статус не змінювався.",
+            reply_markup=main_keyboard(uid),
+        )
+    except PermissionError as exc:
+        bot.send_message(message.chat.id, f"⛔ {esc(exc)}", reply_markup=main_keyboard(uid))
+        clear_state(uid)
+    except ValueError as exc:
+        bot.send_message(message.chat.id, esc(exc), reply_markup=cancel_keyboard())
+    except Exception:
+        logger.exception("TTN save failed")
+        clear_state(uid)
+        bot.send_message(message.chat.id, "Не вдалося зберегти ТТН. Спробуй ще раз пізніше.", reply_markup=main_keyboard(uid))
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("order_delete:"))
@@ -1661,7 +1574,7 @@ def handle_shift_date(message):
     with state_lock:
         user_states[uid]["state"] = "shift_start_time"
 
-    bot.send_message(message.chat.id, "Введи час початку у форматі HH:MM, наприклад 09:00:")
+    bot.send_message(message.chat.id, "Введи час початку у форматі HH:MM, наприклад 09:00:", reply_markup=cancel_keyboard())
 
 
 @bot.message_handler(func=lambda m: get_state(m.from_user.id).get("state") == "shift_start_time")
@@ -1679,7 +1592,7 @@ def handle_shift_start_time(message):
     with state_lock:
         user_states[uid]["state"] = "shift_end_time"
 
-    bot.send_message(message.chat.id, "Введи час завершення у форматі HH:MM, наприклад 18:00:")
+    bot.send_message(message.chat.id, "Введи час завершення у форматі HH:MM, наприклад 18:00:", reply_markup=cancel_keyboard())
 
 
 @bot.message_handler(func=lambda m: get_state(m.from_user.id).get("state") == "shift_end_time")
@@ -1712,7 +1625,12 @@ def handle_shift_end_time(message):
                 AND start_time < ? AND end_time > ? LIMIT 1""",
                 (employee_id, day, value, data["start_time"])).fetchone()
             if overlap:
-                bot.send_message(message.chat.id, f"У працівника вже є зміна #{overlap['id']} у цей час. Нову зміну не створено.")
+                clear_state(uid)
+                bot.send_message(
+                    message.chat.id,
+                    f"У працівника вже є зміна #{overlap['id']} у цей час. Нову зміну не створено.",
+                    reply_markup=main_keyboard(uid),
+                )
                 return
             cursor = conn.execute("""
                 INSERT INTO shifts (
@@ -1733,12 +1651,19 @@ def handle_shift_end_time(message):
             "end": value,
         })
 
-        notify_user(
+        delivered = notify_user(
             employee_id,
             f"🗓 <b>Тобі призначено зміну #{shift_id}</b>\n"
             f"Дата: {esc(day)}\n"
             f"Час: {esc(data['start_time'])}–{esc(value)}\n"
             "Переглянути зміну можна в меню «🕒 Мої зміни»."
+        )
+        bot.send_message(
+            message.chat.id,
+            f"✅ Зміну #{shift_id} призначено на {esc(day)}, "
+            f"{esc(data['start_time'])}–{esc(value)}. "
+            + ("Працівника повідомлено." if delivered else "⚠️ Зміну збережено, але повідомлення працівнику не доставлено."),
+            reply_markup=main_keyboard(uid),
         )
         bot.send_message(
             message.chat.id,
@@ -1948,26 +1873,6 @@ def callback_sos_reason(call):
 
 
 @bot.message_handler(func=lambda m: get_state(m.from_user.id).get("state") == "sos_description")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def handle_sos_description(message):
     uid = message.from_user.id
     state = get_state(uid)
@@ -2036,12 +1941,31 @@ def callback_sos_confirm(call):
         f"Опис: {esc(data.get('description') or 'Не вказано')}\n\n"
         "Натисніть підтвердження, щоб зупинити повторні нагадування."
     )
-    sent = notify_owners(msg, keyboard)
+    # Owners get the actionable SOS with acknowledgement button and recurring reminders.
+    sent_owners = notify_owners(msg, keyboard)
+    # All other active, authorized users get one initial alert only. Repeats are owner-only.
+    with db_connection() as conn:
+        other_users = conn.execute(
+            "SELECT user_id FROM users WHERE role!='' AND is_blocked=0 AND role!='owner' AND user_id!=?",
+            (uid,)
+        ).fetchall()
+    staff_alert = (
+        f"🚨 <b>SOS OFFICE #{incident_id}</b>\n"
+        f"Хто: {esc(display_name)}\n"
+        f"Причина: {esc(data.get('reason', 'Інше'))}\n"
+        f"Час: {esc(now_text())}\n"
+        f"Опис: {esc(data.get('description') or 'Не вказано')}\n\n"
+        "Це одноразове сповіщення для команди. За невідкладної небезпеки телефонуй 112 або 103."
+    )
+    sent_staff = 0
+    for row in other_users:
+        if notify_user(int(row['user_id']), staff_alert):
+            sent_staff += 1
     bot.answer_callback_query(call.id, "SOS зареєстровано.")
     bot.send_message(
         call.message.chat.id,
         f"🚨 Інцидент #{incident_id} зареєстровано. "
-        f"Сповіщення надіслано власникам: {sent}.\n"
+        f"Сповіщено власників: {sent_owners}; команду: {sent_staff}.\n"
         "Цей бот не викликає екстрені служби автоматично. За невідкладної небезпеки телефонуй 112 або 103."
     )
 
@@ -2073,8 +1997,8 @@ def callback_sos_ack(call):
         if not incident:
             bot.answer_callback_query(call.id, "Інцидент не знайдено.")
             return
-        if incident["status"] == "closed":
-            bot.answer_callback_query(call.id, "Інцидент уже закрито.")
+        if incident["status"] in ("acknowledged", "closed"):
+            bot.answer_callback_query(call.id, "Отримання цього SOS уже підтверджено.")
             return
         conn.execute("""
             UPDATE sos_incidents SET status='acknowledged',
@@ -2085,7 +2009,8 @@ def callback_sos_ack(call):
     bot.answer_callback_query(call.id, "Отримання підтверджено.")
     bot.send_message(
         call.message.chat.id,
-        f"✅ SOS #{incident_id}: отримання підтверджено. Інцидент ще не закрито."
+        f"✅ SOS #{incident_id}: отримання підтверджено. Повторні нагадування зупинено; інцидент ще не закрито.",
+        reply_markup=main_keyboard(uid),
     )
     notify_user(
         incident["user_id"],
@@ -2367,6 +2292,63 @@ def clear_ai_history(user_id, mode=None):
         else:
             conn.execute("DELETE FROM ai_conversations WHERE user_id=?", (int(user_id),))
 
+def build_ai_crm_context(user_id, question):
+    """Return permission-filtered CRM facts only when the user asks about CRM/orders."""
+    q = (question or "").lower()
+    crm_terms = (
+        "замовлен", "заказ", "crm", "ттн", "накладн", "відправ", "відправлен",
+        "достав", "статус", "скільки", "є зараз", "нові замовлення", "ненадіслан",
+        "клієнт", "телефон замовлення", "замовлень"
+    )
+    if not any(term in q for term in crm_terms):
+        return ""
+
+    if not (has_permission(user_id, "view_all_orders") or has_permission(user_id, "view_unsent_orders") or has_permission(user_id, "search_orders")):
+        return (
+            "CRM_CONTEXT: Користувач не має дозволу переглядати замовлення в CRM. "
+            "Не показуй і не вигадуй дані замовлень; поясни, що потрібен відповідний доступ."
+        )
+
+    try:
+        with db_connection() as conn:
+            total = conn.execute("SELECT COUNT(*) AS n FROM orders").fetchone()["n"]
+            status_rows = conn.execute(
+                "SELECT COALESCE(NULLIF(status,''),'Без статусу') AS status, COUNT(*) AS n "
+                "FROM orders GROUP BY status ORDER BY n DESC"
+            ).fetchall()
+            rows = []
+            # Only expose full order details to users with full-order viewing permission.
+            if has_permission(user_id, "view_all_orders") or has_permission(user_id, "search_orders"):
+                rows = conn.execute(
+                    "SELECT id, order_number, full_name, city, status, ttn, created_at "
+                    "FROM orders ORDER BY id DESC LIMIT 15"
+                ).fetchall()
+            elif has_permission(user_id, "view_unsent_orders"):
+                rows = conn.execute(
+                    "SELECT id, order_number, full_name, city, status, ttn, created_at "
+                    "FROM orders WHERE COALESCE(NULLIF(TRIM(status), ''), 'Нове') NOT IN ('Надіслано','Скасовано') "
+                    "AND COALESCE(TRIM(ttn), '') = '' ORDER BY id DESC LIMIT 15"
+                ).fetchall()
+
+        lines = [f"Усього замовлень у CRM: {total}."]
+        if status_rows:
+            lines.append("Кількість за статусами: " + "; ".join(f"{r['status']}: {r['n']}" for r in status_rows) + ".")
+        if rows:
+            lines.append("Останні доступні замовлення (не більше 15):")
+            for r in rows:
+                lines.append(
+                    f"#{r['id']}; номер={r['order_number'] or '—'}; клієнт={r['full_name'] or '—'}; "
+                    f"місто={r['city'] or '—'}; статус={r['status'] or 'Без статусу'}; "
+                    f"ТТН={r['ttn'] or '—'}; створено={r['created_at'] or '—'}"
+                )
+        else:
+            lines.append("Деталі замовлень недоступні цьому користувачу за правами доступу.")
+        return "АКТУАЛЬНІ ДАНІ CRM, отримані безпосередньо з бази на час запиту:\n" + "\n".join(lines)
+    except Exception:
+        logger.exception("Could not build CRM context for AI user %s", user_id)
+        return "CRM_CONTEXT: Не вдалося прочитати базу CRM. Не роби висновків про кількість або статус замовлень; повідом про помилку доступу до даних."
+
+
 def ai_answer(user_id, question, mode="assistant"):
     if not OPENAI_API_KEY:
         return "AI-помічник не налаштований: додай OPENAI_API_KEY у змінні Render."
@@ -2374,7 +2356,14 @@ def ai_answer(user_id, question, mode="assistant"):
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY, timeout=45.0, max_retries=2)
         history = get_ai_history(user_id, mode, limit=100)
-        history.append({"role": "user", "content": question[:12000]})
+        crm_context = build_ai_crm_context(user_id, question) if mode == "assistant" else ""
+        user_input = question[:12000]
+        if crm_context:
+            user_input = (
+                user_input + "\n\n[ВНУТРІШНІ ДАНІ CRM ДЛЯ ВІДПОВІДІ; дотримуйся прав доступу, "
+                "не вигадуй відсутні факти]:\n" + crm_context
+            )
+        history.append({"role": "user", "content": user_input})
         instructions = (
             "Ти AI-помічник українського вейпшопу Haimer Brend Shop (HBS), а не лише CRM. "
             "Допомагай із товарами вейпшопу, поясненнями характеристик, сервісом клієнтів, "
@@ -2387,6 +2376,10 @@ def ai_answer(user_id, question, mode="assistant"):
             "відмов; якщо запит безпечний, допомагай максимально практично. Дотримуйся "
             "законодавства та правил безпеки, зокрема щодо вікових обмежень на нікотинові "
             "товари; не допомагай обходити перевірку віку чи продавати заборонені товари. "
+            "Дані CRM доступні лише тоді, коли вони явно передані в повідомленні як актуальний "
+            "контекст CRM. Якщо такий контекст є, відповідай на питання про замовлення конкретно, "
+            "використовуючи тільки наведені факти та враховуючи позначені обмеження доступу. "
+            "Якщо контексту немає або він повідомляє про помилку/відсутність дозволу, прямо скажи це. "
             "Не вигадуй дані CRM і не стверджуй, що маєш доступ до бази чи інтернету, якщо "
             "інструмент недоступний. Ніколи не проси паролі, токени або API-ключі. "
             "Підтримуй довгий багатокроковий діалог: використовуй попередню історію, "
@@ -2404,6 +2397,59 @@ def ai_answer(user_id, question, mode="assistant"):
     except Exception:
         logger.exception("AI request failed for user %s", user_id)
         return "AI тимчасово недоступний. Перевір ключ API, модель і журнал Render."
+
+
+@bot.message_handler(func=lambda m: m.text == "⏰ Нагадування команди")
+def handle_staff_reminder_start(message):
+    uid = message.from_user.id
+    if not require_permission(message, "broadcast"):
+        return
+    set_state(uid, "staff_reminder_time", {})
+    bot.send_message(
+        message.chat.id,
+        "Вкажи час щоденного нагадування за Києвом у форматі HH:MM (наприклад, 09:30).\n"
+        "Після цього введеш текст, який щодня отримуватимуть усі активні працівники.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@bot.message_handler(func=lambda m: get_state(m.from_user.id).get("state") == "staff_reminder_time")
+def handle_staff_reminder_time(message):
+    uid = message.from_user.id
+    value = (message.text or "").strip()
+    try:
+        datetime.strptime(value, "%H:%M")
+    except ValueError:
+        bot.send_message(message.chat.id, "Невірний час. Приклад: 09:30", reply_markup=cancel_keyboard())
+        return
+    set_state(uid, "staff_reminder_text", {"reminder_time": value})
+    bot.send_message(message.chat.id, "Тепер введи текст нагадування:", reply_markup=cancel_keyboard())
+
+
+@bot.message_handler(func=lambda m: get_state(m.from_user.id).get("state") == "staff_reminder_text")
+def handle_staff_reminder_text(message):
+    uid = message.from_user.id
+    if not require_permission(message, "broadcast"):
+        clear_state(uid)
+        return
+    content = (message.text or "").strip()
+    if not content:
+        bot.send_message(message.chat.id, "Текст не може бути порожнім.", reply_markup=cancel_keyboard())
+        return
+    data = get_state_data(uid)
+    with db_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO staff_reminders(created_by,reminder_time,message,active,last_sent_date,created_at) VALUES(?,?,?,1,'',?)",
+            (uid, data["reminder_time"], content, now_text()),
+        )
+        reminder_id = cur.lastrowid
+    clear_state(uid)
+    log_event("staff_reminder_created", uid, {"reminder_id": reminder_id, "time": data["reminder_time"]})
+    bot.send_message(
+        message.chat.id,
+        f"✅ Щоденне нагадування #{reminder_id} створено.\nЧас: {esc(data['reminder_time'])} (Київ)\nТекст: {esc(content)}",
+        reply_markup=main_keyboard(uid),
+    )
 
 
 @bot.message_handler(func=lambda m: m.text == "🤖 AI-помічник")
@@ -2830,11 +2876,43 @@ def send_daily_order_reminders(current):
         "uncollected": len(uncollected), "awaiting_ttn": len(awaiting_ttn)
     })
 
+def send_scheduled_staff_reminders(current):
+    """Send each active daily team reminder at most once per Kyiv calendar day."""
+    today = current.strftime("%Y-%m-%d")
+    clock = current.strftime("%H:%M")
+    with db_connection() as conn:
+        reminders = conn.execute(
+            "SELECT * FROM staff_reminders WHERE active=1 AND reminder_time<=? AND COALESCE(last_sent_date,'')!=?",
+            (clock, today),
+        ).fetchall()
+        recipients = conn.execute(
+            "SELECT user_id FROM users WHERE role!='' AND is_blocked=0",
+        ).fetchall()
+    if not reminders:
+        return
+    recipient_ids = [int(row["user_id"]) for row in recipients]
+    for reminder in reminders:
+        sent = failed = 0
+        for recipient_id in recipient_ids:
+            if notify_user(recipient_id, "⏰ <b>Нагадування команди</b>\n\n" + esc(reminder["message"])):
+                sent += 1
+            else:
+                failed += 1
+            time.sleep(0.03)
+        # Mark as sent for today even if some recipients blocked the bot, preventing repeated spam.
+        with db_connection() as conn:
+            conn.execute("UPDATE staff_reminders SET last_sent_date=? WHERE id=?", (today, reminder["id"]))
+        log_event("staff_reminder_sent", reminder["created_by"], {
+            "reminder_id": int(reminder["id"]), "date": today, "sent": sent, "failed": failed
+        })
+
+
 def reminder_worker():
     while not stop_event.is_set():
         try:
             current = now_local()
             send_daily_order_reminders(current)
+            send_scheduled_staff_reminders(current)
             with db_connection() as conn:
                 shifts = conn.execute("""
                     SELECT * FROM shifts
